@@ -27,6 +27,7 @@ class ChatMessage(BaseModel):
     name: Optional[str] = None
     tool_calls: Optional[list[ChatToolCall]] = None
     tool_call_id: Optional[str] = None
+    reasoning_content: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -39,6 +40,15 @@ class ChatRequest(BaseModel):
 
 
 # Responses API 模型
+class RespReasoningItem(BaseModel):
+    type: Literal["reasoning"] = "reasoning"
+    id: str = Field(default_factory=lambda: _generate_id("rs"))
+    summary: list[Any] = Field(default_factory=list)
+    encrypted_content: Optional[str] = None
+    reasoning_content: Optional[str] = None
+    status: Optional[str] = None
+
+
 class RespMessageItem(BaseModel):
     type: Literal["message"] = "message"
     id: str = Field(default_factory=lambda: _generate_id("msg"))
@@ -61,7 +71,7 @@ class RespFunctionOutputItem(BaseModel):
     output: str
 
 
-RespItem = Union[RespMessageItem, RespFunctionCallItem, RespFunctionOutputItem]
+RespItem = Union[RespReasoningItem, RespMessageItem, RespFunctionCallItem, RespFunctionOutputItem]
 
 
 # ─── 请求转换 ───────────────────────────────────────────────
@@ -105,6 +115,18 @@ def _stringify_tool_payload(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def _merge_reasoning_content(current: Optional[str], new: Optional[str]) -> Optional[str]:
+    if not new:
+        return current
+    if not current:
+        return new
+    return f"{current}{new}"
+
+
+def _extract_reasoning_content(item: RespReasoningItem) -> str:
+    return item.reasoning_content or item.encrypted_content or ""
+
+
 def _parse_response_input_item(raw_item: Any) -> RespItem | None:
     """宽容解析 Responses input 历史项，跳过 Chat Completions 无法表达的内部项。"""
     if not isinstance(raw_item, dict):
@@ -112,7 +134,12 @@ def _parse_response_input_item(raw_item: Any) -> RespItem | None:
 
     item_type = raw_item.get("type")
     if item_type == "reasoning":
-        return None
+        item = dict(raw_item)
+        if item.get("summary") is None:
+            item["summary"] = []
+        if item.get("encrypted_content") is None and item.get("reasoning_content") is not None:
+            item["encrypted_content"] = item["reasoning_content"]
+        return RespReasoningItem.model_validate(item)
 
     if item_type == "message":
         item = dict(raw_item)
@@ -166,24 +193,43 @@ def convert_request(req: dict[str, Any]) -> dict[str, Any]:
             item for item in (_parse_response_input_item(raw_item) for raw_item in input_data)
             if item is not None
         ]
+        pending_reasoning_content: Optional[str] = None
 
         for item in items:
+            if isinstance(item, RespReasoningItem):
+                pending_reasoning_content = _merge_reasoning_content(
+                    pending_reasoning_content, _extract_reasoning_content(item)
+                )
+                continue
+
             if isinstance(item, RespMessageItem):
-                chat_messages.append(ChatMessage(
+                chat_message = ChatMessage(
                     role=item.role,
                     content=_extract_message_content(item.content)
-                ))
+                )
+                if item.role == "assistant" and pending_reasoning_content:
+                    chat_message.reasoning_content = pending_reasoning_content
+                    pending_reasoning_content = None
+                chat_messages.append(chat_message)
 
             elif isinstance(item, RespFunctionCallItem):
                 tc = ChatToolCall(id=item.call_id, function=ChatFunctionDef(
                     name=item.name, arguments=item.arguments))
                 if chat_messages and chat_messages[-1].role == "assistant":
+                    if pending_reasoning_content:
+                        chat_messages[-1].reasoning_content = _merge_reasoning_content(
+                            chat_messages[-1].reasoning_content, pending_reasoning_content
+                        )
+                        pending_reasoning_content = None
                     if chat_messages[-1].tool_calls is None:
                         chat_messages[-1].tool_calls = []
                     chat_messages[-1].tool_calls.append(tc)
                 else:
-                    chat_messages.append(ChatMessage(
-                        role="assistant", tool_calls=[tc]))
+                    chat_message = ChatMessage(role="assistant", tool_calls=[tc])
+                    if pending_reasoning_content:
+                        chat_message.reasoning_content = pending_reasoning_content
+                        pending_reasoning_content = None
+                    chat_messages.append(chat_message)
 
             elif isinstance(item, RespFunctionOutputItem):
                 chat_messages.append(ChatMessage(
@@ -231,6 +277,13 @@ def convert_response(chat_resp: dict[str, Any]) -> dict[str, Any]:
     choice = (chat_resp.get("choices") or [{}])[0]
     message = choice.get("message", {})
     output_items: list[RespItem] = []
+
+    if reasoning_content := message.get("reasoning_content"):
+        output_items.append(RespReasoningItem(
+            status="completed",
+            summary=[],
+            encrypted_content=reasoning_content
+        ))
 
     content_parts = []
     if content := message.get("content"):
@@ -295,6 +348,9 @@ class ResponsesStreamConverter:
         self._created_at = int(time.time())
 
         self._next_out_idx = 0
+        self._reasoning_out_idx: Optional[int] = None
+        self._reasoning_buf = ""
+        self._reasoning_closed = False
         self._text_out_idx: Optional[int] = None
         self._text_buf = ""
         self._text_closed = False
@@ -353,12 +409,18 @@ class ResponsesStreamConverter:
         if delta.get("role"):
             yield from self._emit_response_created()
 
+        if reasoning_content := delta.get("reasoning_content"):
+            yield from self._ensure_reasoning_item_started()
+            self._reasoning_buf += reasoning_content
+
         if content := delta.get("content"):
+            yield from self._close_reasoning_item()
             yield from self._ensure_text_item_started()
             self._text_buf += content
             yield _sse_event("response.output_text.delta", {"output_index": self._text_out_idx, "content_index": 0, "delta": content})
 
         for tc in (delta.get("tool_calls") or []):
+            yield from self._close_reasoning_item()
             yield from self._handle_tool_call_delta(tc)
 
     def _handle_tool_call_delta(self, tc: dict[str, Any]) -> Iterator[str]:
@@ -402,6 +464,23 @@ class ResponsesStreamConverter:
             yield _sse_event("response.output_item.added", {"output_index": self._text_out_idx, "item": msg_item})
             yield _sse_event("response.content_part.added", {"output_index": self._text_out_idx, "content_index": 0, "part": {"type": "output_text", "text": ""}})
 
+    def _ensure_reasoning_item_started(self) -> Iterator[str]:
+        yield from self._emit_response_created()
+        if self._reasoning_out_idx is None:
+            self._reasoning_out_idx = self._allocate_index()
+            reasoning_item = RespReasoningItem(status="in_progress", summary=[])
+            yield _sse_event("response.output_item.added", {"output_index": self._reasoning_out_idx, "item": reasoning_item})
+
+    def _close_reasoning_item(self) -> Iterator[str]:
+        if self._reasoning_out_idx is not None and not self._reasoning_closed:
+            self._reasoning_closed = True
+            reasoning_item = RespReasoningItem(
+                status="completed",
+                summary=[],
+                encrypted_content=self._reasoning_buf,
+            )
+            yield _sse_event("response.output_item.done", {"output_index": self._reasoning_out_idx, "item": reasoning_item})
+
     def _close_text_content(self) -> Iterator[str]:
         if self._text_out_idx is not None and not self._text_closed:
             self._text_closed = True
@@ -416,6 +495,7 @@ class ResponsesStreamConverter:
         if self._content_done:
             return
         self._content_done = True
+        yield from self._close_reasoning_item()
         yield from self._close_text_content()
 
         if finish_reason == "tool_calls":
@@ -430,6 +510,12 @@ class ResponsesStreamConverter:
         self._completion_emitted = True
 
         resp = self._base_response("completed")
+        if self._reasoning_out_idx is not None:
+            resp.output.append(RespReasoningItem(
+                status="completed",
+                summary=[],
+                encrypted_content=self._reasoning_buf,
+            ))
         if self._text_out_idx is not None or not self._tool_calls:
             resp.output.append(RespMessageItem(id=self._msg_id, role="assistant", status="completed", content=[
                                {"type": "output_text", "text": self._text_buf, "annotations": []}]))

@@ -1,19 +1,28 @@
 import asyncio
 import base64
 import binascii
-import fcntl
 import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TextIO
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 import uvicorn
 import os
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 MODEL_MAPPING_FILE = Path(__file__).parent.parent / "model_mapping.json"
 
@@ -201,10 +210,35 @@ PROCESS_LOCK_PATH = os.getenv("MIMO_PROCESS_LOCK_PATH", os.path.join(ROOT_DIR, "
 
 # 后台 fire-and-forget 任务集合
 _background_tasks: set[asyncio.Task] = set()
+PROCESS_LOCK_SIZE = 1
 
 def _track_task(task: asyncio.Task) -> None:
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
+
+def _lock_file_nonblocking(lock_file: TextIO) -> None:
+    if os.name == "nt":
+        if msvcrt is None:
+            raise OSError("当前平台缺少 msvcrt，无法加锁。")
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, PROCESS_LOCK_SIZE)
+        return
+
+    if fcntl is None:
+        raise OSError("当前平台缺少 fcntl，无法加锁。")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+def _unlock_file(lock_file: TextIO) -> None:
+    if os.name == "nt":
+        if msvcrt is None:
+            raise OSError("当前平台缺少 msvcrt，无法解锁。")
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, PROCESS_LOCK_SIZE)
+        return
+
+    if fcntl is None:
+        raise OSError("当前平台缺少 fcntl，无法解锁。")
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 def acquire_single_process_lock() -> None:
     global single_process_lock_file
@@ -212,8 +246,14 @@ def acquire_single_process_lock() -> None:
         return
 
     try:
-        lock_file = open(PROCESS_LOCK_PATH, "w", encoding="utf-8")
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_path = Path(PROCESS_LOCK_PATH)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.touch(exist_ok=True)
+        lock_file = lock_path.open("r+", encoding="utf-8")
+        if lock_path.stat().st_size < PROCESS_LOCK_SIZE:
+            lock_file.write("\n")
+            lock_file.flush()
+        _lock_file_nonblocking(lock_file)
     except (BlockingIOError, OSError) as exc:
         if 'lock_file' in locals():
             lock_file.close()
@@ -230,7 +270,7 @@ def release_single_process_lock() -> None:
     if single_process_lock_file is None:
         return
     try:
-        fcntl.flock(single_process_lock_file.fileno(), fcntl.LOCK_UN)
+        _unlock_file(single_process_lock_file)
     finally:
         single_process_lock_file.close()
         single_process_lock_file = None

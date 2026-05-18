@@ -22,9 +22,11 @@ cp env.example .env
 python main.py
 ```
 
-## 技术栈
-
-Python / FastAPI / Uvicorn / WebSocket
+## 前置条件
+一台拥有公网 ip 的机器，或者本机进行内网穿透。此为必备配置选项
+```bash
+WS_TUNNEL_URL=ws://your-domain.com:8000/ws
+```
 
 ## 免责声明
 
